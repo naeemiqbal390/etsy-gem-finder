@@ -98,7 +98,17 @@ def get_live_search_suggestions(query):
 # Function to generate product gems
 def generate_gems(niche, api_key):
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
+   # Auto-select available model (prevents 404 errors)
+    available_models = ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-1.5-flash', 'gemini-pro']
+    model = None
+    for model_name in available_models:
+        try:
+            model = genai.GenerativeModel(model_name)
+            break
+        except Exception:
+            continue
+    if not model:
+        model = genai.GenerativeModel('gemini-2.5-flash')
 
     # Fetch live search signals
     seed_terms = [f"{niche} tracker", f"{niche} binder", f"{niche} log book", f"{niche} template"]
