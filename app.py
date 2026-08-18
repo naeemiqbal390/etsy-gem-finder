@@ -90,7 +90,7 @@ def get_live_search_suggestions(query):
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
             data = json.loads(response.text)
-            return data[1][:5] # Return top 5 suggestions
+            return data[1][:5]
     except Exception:
         pass
     return []
@@ -99,17 +99,9 @@ def get_live_search_suggestions(query):
 def generate_gems(niche, api_key):
     genai.configure(api_key=api_key)
 
-    # 1. Dynamically find an active model on your API key
-    try:
-        available_models = [
-            m.name for m in genai.list_models() 
-            if 'generateContent' in m.supported_generation_methods
-        ]
-        selected_model = next((m for m in available_models if 'flash' in m), available_models[0])
-        model = genai.GenerativeModel(selected_model)
-    except Exception as err:
-        raise Exception(f"Could not load an active model from your API key: {err}")
-        
+    # Directly targeting the standard working Gemini model
+    model = genai.GenerativeModel('gemini-1.5-flash')
+
     # Fetch live search signals
     seed_terms = [f"{niche} tracker", f"{niche} binder", f"{niche} log book", f"{niche} template"]
     live_signals = []
@@ -158,7 +150,7 @@ if st.button("✨ Find 3 Hidden Product Gems"):
                 gems = generate_gems(selected_niche, api_key)
                 st.session_state.current_gems = gems
             except Exception as e:
-                st.error(f"Error generating ideas. Check your API key. Details: {e}")
+                st.error(f"Error generating ideas: {e}")
 
 # Display Results
 if "current_gems" in st.session_state:
