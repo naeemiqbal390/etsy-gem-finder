@@ -95,24 +95,59 @@ def get_live_search_suggestions(query):
         pass
     return []
 
-# Function to generate product gems
+# Function to generate product gems using Gemini 3.6 Flash
 def generate_gems(niche, api_key):
     genai.configure(api_key=api_key)
 
-    # Automatically query your key for its exact supported model string
-    selected_model = None
+    # Directly target Gemini 3.6 Flash or auto-detect available 3.x Flash models
+    selected_model = "gemini-3.6-flash"
     try:
         for m in genai.list_models():
             if 'generateContent' in m.supported_generation_methods:
-                if 'flash' in m.name:
-                    selected_model = m.name
+                clean_name = m.name.replace('models/', '')
+                if '3.6-flash' in clean_name or 'flash' in clean_name:
+                    selected_model = clean_name
                     break
-        if not selected_model:
-            selected_model = "models/gemini-1.5-flash"
     except Exception:
-        selected_model = "gemini-1.5-flash"
+        selected_model = "gemini-3.6-flash"
 
     model = genai.GenerativeModel(selected_model)
+
+    # Fetch live search signals
+    seed_terms = [f"{niche} tracker", f"{niche} binder", f"{niche} log book", f"{niche} template"]
+    live_signals = []
+    for term in seed_terms:
+        live_signals.extend(get_live_search_suggestions(term))
+
+    signals_text = ", ".join(live_signals) if live_signals else "general search trends"
+    excluded_text = ", ".join(st.session_state.used_gems) if st.session_state.used_gems else "None"
+
+    prompt = f"""
+    You are an expert Etsy market researcher specializing in digital downloads (PDFs, Canva templates, spreadsheets).
+    Target Niche: {niche}
+    Real Search Signals Found: {signals_text}
+    Previously Used/Excluded Ideas: {excluded_text}
+
+    Task:
+    Provide exactly 3 hidden gem digital product ideas that have HIGH search intent but LOW competition on Etsy.
+    Do NOT suggest basic/generic ideas (e.g., plain "Daily Planner" or "Goal Tracker"). Suggest specific, functional tools for this micro-niche.
+
+    Return ONLY a raw JSON array containing 3 objects with these exact keys:
+    [
+      {{
+        "title": "Exact Product Name",
+        "format": "e.g., Printable PDF / Canva Template / Excel Sheet",
+        "description": "2-sentence functional overview of what is included in the download.",
+        "search_intent": "The long-tail keyword real users search for",
+        "competition": "Low or Very Low",
+        "demand": "High"
+      }}
+    ]
+    """
+
+    response = model.generate_content(prompt)
+    clean_json = response.text.replace("```json", "").replace("```", "").strip()
+    return json.loads(clean_json)
 
     # Fetch live search signals
     seed_terms = [f"{niche} tracker", f"{niche} binder", f"{niche} log book", f"{niche} template"]
