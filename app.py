@@ -1,529 +1,492 @@
-import streamlit as st
-import google.generativeai as genai
-import requests
+import io
 import json
 import re
+import time
+import uuid
+from urllib.parse import quote_plus
 
-# requirements.txt for this app should include:
-#   streamlit
-#   google-generativeai
-#   requests
-#   pytrends        (optional — enables the Google Trends interest score)
-#   beautifulsoup4  (optional — enables the "actually selling" real-signal scraper below)
+import pandas as pd
+import requests
+import streamlit as st
+import google.generativeai as genai
 
-# Optional: real (relative) search-interest signal from Google Trends.
-# This is an unofficial API and can occasionally fail/rate-limit — always wrapped in try/except.
 try:
     from pytrends.request import TrendReq
-    PYTRENDS_AVAILABLE = True
+    PYTRENDS = True
 except ImportError:
-    PYTRENDS_AVAILABLE = False
+    PYTRENDS = False
 
-# Optional: needed to parse Etsy's public search-results HTML for real "bought/bestseller" badges.
+st.set_page_config(page_title="Opportunity Radar", page_icon="🎯", layout="wide")
+
+# ---------------------------------------------------------------------------
+# CONSTANTS
+# ---------------------------------------------------------------------------
+WEIGHTS = {"demand": 20, "intent": 15, "gap": 20, "pain": 15,
+           "wtp": 15, "feasibility": 10, "distribution": 5}
+CONF_FACTOR = {"High": 1.0, "Medium": 0.85, "Low": 0.7}
+
+PROBLEM_COLS = ["problem_id", "buyer", "problem", "desired_outcome", "workaround",
+                "gap", "solution", "search_phrases", "evidence_type",
+                "evidence_strength", "source_url", "source_date", "notes"]
+OPP_COLS = ["opp_id", "cluster", "buyer", "problem", "transformation", "product_idea",
+            "working_title", "hero_line", "format", "price_hint", "search_phrases",
+            "alternatives", "unmet_need", "demand", "intent", "gap", "pain", "wtp",
+            "feasibility", "distribution", "confidence", "autocomplete_hits",
+            "trends", "status", "next_action"]
+KW_COLS = ["keyword", "seed", "source", "date"]
+
+BUYERS = ["Freelancers & consultants", "Etsy & digital-product sellers", "Landlords & property managers",
+          "Small retailers & shopkeepers", "Teachers & tutors", "Job seekers", "Bookkeepers",
+          "Event & wedding planners", "Content creators", "Coaches", "Home-based businesses",
+          "Parents managing family logistics", "Students", "Fitness professionals",
+          "Pet-service providers", "Tradespeople & contractors", "Nonprofit administrators",
+          "Photographers", "Foster & kinship parents", "Therapists & counselors (admin side)"]
+JOBS = ["calculate", "track", "compare options", "prepare a document", "plan a project",
+        "prevent costly errors", "price correctly", "get paid on time", "stay organized",
+        "onboard a client", "forecast expenses", "prepare for a deadline", "reconcile records",
+        "report results", "save time on repeat work"]
+SUFFIXES = ["spreadsheet", "template", "calculator", "tracker", "checklist", "workbook",
+            "system", "kit", "for beginners", "excel", "google sheets"]
+PREFIXES = ["how to", "best way to", "i need to", "help with"]
+
+# ---------------------------------------------------------------------------
+# STATE
+# ---------------------------------------------------------------------------
+def init_state():
+    for key, cols in (("problems", PROBLEM_COLS), ("opps", OPP_COLS), ("keywords", KW_COLS)):
+        if key not in st.session_state:
+            st.session_state[key] = pd.DataFrame(columns=cols)
+
+init_state()
+
+
+def ensure(df, cols):
+    for c in cols:
+        if c not in df.columns:
+            df[c] = ""
+    return df[cols]
+
+
+def add_rows(key, cols, rows):
+    new = pd.DataFrame(rows)
+    new = ensure(new, cols)
+    old = ensure(st.session_state[key], cols)
+    st.session_state[key] = pd.concat([old, new], ignore_index=True)
+
+
+def uid(prefix):
+    return f"{prefix}-{uuid.uuid4().hex[:6]}"
+
+# ---------------------------------------------------------------------------
+# SIDEBAR
+# ---------------------------------------------------------------------------
+st.sidebar.header("⚙️ Setup (all free)")
 try:
-    from bs4 import BeautifulSoup
-    BS4_AVAILABLE = True
-except ImportError:
-    BS4_AVAILABLE = False
-
-# Page Configuration
-st.set_page_config(page_title="Etsy Digital Gem Finder", page_icon="💎", layout="wide")
-
-st.title("💎 Etsy Digital Product Gem Finder")
-st.write("Discover low-competition, high-demand digital product ideas — filtered to products you can actually build with AI (Claude/Gemini), not design tools.")
-
-# Initialize Session State
-if "used_gems" not in st.session_state:
-    st.session_state.used_gems = set()
-if "real_signals" not in st.session_state:
-    st.session_state.real_signals = []
-if "real_signal_notes" not in st.session_state:
-    st.session_state.real_signal_notes = []
-
-# ---------------------------------------------------------------------------
-# API KEY HANDLING (fixes: app asking for the key every session)
-# ---------------------------------------------------------------------------
-def get_secret_api_key():
-    """Pull the key from Streamlit secrets if it's been set there."""
-    try:
-        return st.secrets.get("GEMINI_API_KEY", None)
-    except Exception:
-        return None
-
-st.sidebar.header("⚙️ Configuration")
-
-secret_key = get_secret_api_key()
-
+    secret_key = st.secrets.get("GEMINI_API_KEY", None)
+except Exception:
+    secret_key = None
 if secret_key:
     api_key = secret_key
-    st.sidebar.success("✅ Gemini API key loaded from secrets — no need to paste it.")
-    with st.sidebar.expander("Use a different key instead"):
-        override_key = st.text_input("Override Gemini API Key:", type="password")
-        if override_key:
-            api_key = override_key
+    st.sidebar.success("Gemini key loaded from secrets.")
 else:
-    st.sidebar.warning("No GEMINI_API_KEY found in st.secrets — add one in your Streamlit Cloud app settings "
-                        "(Settings → Secrets → `GEMINI_API_KEY = \"...\"`) so you stop having to paste it every session.")
-    api_key = st.sidebar.text_input("Enter Gemini API Key:", type="password")
-
-num_gems = st.sidebar.slider("How many AI product ideas to generate:", min_value=3, max_value=10, value=3)
-min_price = st.sidebar.number_input("Minimum typical price ($):", min_value=0, value=15, step=1)
-
-st.sidebar.divider()
-st.sidebar.header("📈 Real Sales Signal")
-use_real_sales = st.sidebar.checkbox(
-    "Check Etsy search results for listings that are ACTUALLY selling",
-    value=True,
-    help="Experimental / best-effort. There is no public Etsy API that reports real sale counts across the "
-         "marketplace (the official API only exposes a shop's own orders to that shop's owner). This instead "
-         "scrapes Etsy's own public search-results page and looks for listings that currently display a real "
-         "'X+ bought in the last/past month' or 'Bestseller' badge — i.e. proof of recent, actual sales, not "
-         "an AI guess. Etsy actively blocks bots and changes its page layout without notice, especially from "
-         "cloud-server IPs (like Streamlit Cloud), so this can return few or zero results even when the "
-         "products genuinely are selling. Treat empty results as inconclusive, not as 'nothing sells here.'"
-)
-max_listings_per_query = st.sidebar.slider("Max listings to check per search term", 5, 30, 15)
-
-# Categorized Niche Library (100+ Specific Micro-Niches)
-CATEGORIZED_NICHES = {
-    "🐔 Pets, Animals & Farming": [
-        "Backyard Poultry Farming", "Dog Groomers", "Dog Trainers", "Pet Sitting & Dog Walking",
-        "Cat Breeders & Catteries", "Aquarium & Fish Keepers", "Reptile & Exotic Pet Owners",
-        "Equestrians & Horse Owners", "Beekeepers & Apiaries", "Veterinary Technicians",
-        "Animal Rescue & Shelters", "Bird Watching Enthusiasts"
-    ],
-    "💼 Business & Service Providers": [
-        "Real Estate Agents", "Airbnb & Short-Term Rental Hosts", "Etsy Shop Owners",
-        "Shopify & E-commerce Sellers", "Bookkeepers & Accountants", "Virtual Assistants",
-        "Social Media Managers", "Freelance Copywriters", "Graphic Designers",
-        "Event & Wedding Planners", "Interior Designers", "Content Creators & YouTubers",
-        "Podcasters", "Life & Business Coaches", "Commercial Cleaning Businesses", "Mobile Car Detailers"
-    ],
-    "🍞 Food, Baking & Hospitality": [
-        "Sourdough Bakers", "Home Bakers & Cake Decorators", "Meal Prep & Planning",
-        "Coffee Shop & Cafe Owners", "Food Truck Vendors", "Catering Businesses",
-        "Canning & Food Preserving", "Homebrewers & Craft Beer", "Bartenders & Mixologists",
-        "Nutritionists & Health Coaches"
-    ],
-    "📚 Education & Parenting": [
-        "Special Education Teachers", "Homeschooling Parents", "Preschool & Kindergarten Teachers",
-        "Elementary Teachers", "High School STEM Teachers", "Music Teachers & Tutors",
-        "Art Teachers", "ESL / TEFL Teachers", "School Counselors", "Daycare & Childcare Owners",
-        "Toddler & Baby Milestones"
-    ],
-    "🧘 Health, Fitness & Wellness": [
-        "Personal Trainers", "Yoga Instructors", "Pilates Instructors", "Mental Health Therapists",
-        "Massage Therapists", "Estheticians & Skincare Techs", "Lash & Nail Technicians",
-        "Doulas & Midwives", "Chiropractors", "Physical Therapists", "Meditation & Mindfulness Guides"
-    ],
-    "🌱 Home, Garden & Homesteading": [
-        "Urban Homesteaders", "Indoor Houseplant Collectors", "Vegetable & Herb Gardeners",
-        "Home Organization & Decluttering", "Landscaping & Lawn Care", "Interior Decorators",
-        "Home Stagers", "Tiny House & Van Life", "DIY Home Renovators"
-    ],
-    "🎨 Crafts, Arts & Trades": [
-        "Handmade Soap Makers", "Candle Makers", "Crochet & Knitting Designers", "Quilters",
-        "Embroidery Artists", "Resin Artists", "Polymer Clay Crafters", "Leather Crafters",
-        "Paper Crafters & Origami", "Jewelry Makers", "Ceramicists & Potters", "Woodworking Hobbyists",
-        "Stained Glass Crafters", "Upcycling Enthusiasts"
-    ],
-    "🎉 Events, Parties & Holidays": [
-        "Wedding Planning & Brides", "Bridal Shower Organizers", "Baby Shower Planners",
-        "Birthday Party Decorators", "Corporate Event Planners", "Graduation Planners"
-    ],
-    "📸 Hobbies & Specialized Interests": [
-        "Photographers", "Videographers", "Travel & RV Living", "Board Game Designers",
-        "Tabletop RPG & D&D Players", "Genealogy & Family Tree Researchers", "Book Club Organizers",
-        "Musicians & Songwriters", "Fitness Competitors", "Scrapbookers & Memory Keeping"
-    ],
-    "✍️ Custom Niche": [
-        "Enter Custom Niche..."
-    ]
-}
-
-# Select Category first
-category = st.selectbox("1. Select Category:", list(CATEGORIZED_NICHES.keys()))
-
-# Select Niche based on Category
-if category == "✍️ Custom Niche":
-    selected_niche = st.text_input("Enter your custom niche or sub-topic:", value="Custom Mechanical Keyboard Builders")
-else:
-    selected_niche = st.selectbox("2. Select Niche:", CATEGORIZED_NICHES[category])
+    api_key = st.sidebar.text_input("Gemini API key (free from aistudio.google.com):", type="password")
+model_name = st.sidebar.text_input(
+    "Gemini model name", value="gemini-2.5-flash",
+    help="If you get a 'model not found' error, open aistudio.google.com and copy a current free-tier "
+         "Flash model name here.")
+min_price = st.sidebar.number_input("Minimum realistic listing value ($)", 0, 200, 15)
+st.sidebar.caption("Tip: your database lives in this browser session. Download it from the 💾 Database tab "
+                   "before closing, and upload it next time.")
 
 
-# Function to fetch Google Autocomplete keywords (real signal: what people actually type)
-def get_live_search_suggestions(query):
+def ask_gemini(prompt, want_json=True):
+    if not api_key:
+        raise RuntimeError("Add a Gemini API key in the sidebar first.")
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name)
     try:
-        url = f"https://suggestqueries.google.com/complete/search?client=chrome&q={query}"
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            data = json.loads(response.text)
-            return data[1][:5]
+        cfg = {"response_mime_type": "application/json"} if want_json else None
+        resp = model.generate_content(prompt, generation_config=cfg) if cfg else model.generate_content(prompt)
+    except Exception:
+        resp = model.generate_content(prompt)
+    return resp.text
+
+
+def parse_json(text):
+    text = text.replace("```json", "").replace("```", "").strip()
+    starts = [i for i in (text.find("["), text.find("{")) if i != -1]
+    if starts:
+        text = text[min(starts):]
+    return json.loads(text)
+
+
+def suggest(query):
+    """Google autocomplete: real phrases real people type. Free, no key."""
+    try:
+        r = requests.get("https://suggestqueries.google.com/complete/search",
+                         params={"client": "firefox", "q": query}, timeout=5)
+        if r.status_code == 200:
+            return r.json()[1]
     except Exception:
         pass
     return []
 
 
-# Function to fetch a real (relative) interest score from Google Trends
-def get_trends_interest(keyword):
-    if not PYTRENDS_AVAILABLE:
-        return None
+def trends_score(keyword):
+    if not PYTRENDS:
+        return ""
     try:
-        pytrends = TrendReq(hl="en-US", tz=360)
-        pytrends.build_payload([keyword], timeframe="today 12-m")
-        data = pytrends.interest_over_time()
-        if data.empty:
-            return None
-        return int(data[keyword].mean())
+        t = TrendReq(hl="en-US", tz=360)
+        t.build_payload([keyword], timeframe="today 12-m")
+        d = t.interest_over_time()
+        return int(d[keyword].mean()) if not d.empty else ""
     except Exception:
-        return None
+        return ""
 
+
+def score_row(r):
+    total, done = 0.0, 0
+    for k, w in WEIGHTS.items():
+        v = pd.to_numeric(r.get(k), errors="coerce")
+        v = 0 if pd.isna(v) else min(max(v, 0), 5)
+        total += w * v / 5
+        done += 1 if v > 0 else 0
+    completeness = done / len(WEIGHTS)
+    adj = total * CONF_FACTOR.get(r.get("confidence"), 0.7) * (0.5 + 0.5 * completeness)
+    return round(total, 1), round(completeness * 100), round(adj, 1)
+
+
+def verdict(adj, completeness):
+    if completeness < 70:
+        return "Research more (incomplete scoring)"
+    if adj >= 70:
+        return "VALIDATE NOW"
+    if adj >= 55:
+        return "Investigate competitors"
+    if adj >= 40:
+        return "Collect more evidence"
+    return "Archive"
+
+
+def df_download(df, label, name):
+    st.download_button(label, df.to_csv(index=False).encode("utf-8"), name, "text/csv")
 
 # ---------------------------------------------------------------------------
-# REAL SIGNAL: check Etsy's own search results for listings that are
-# currently displaying a genuine "bought in the last/past month" or
-# "Bestseller" badge — i.e. proof of recent, actual sales.
+# UI
 # ---------------------------------------------------------------------------
-_SOLD_BADGE_PATTERNS = [
-    re.compile(r'[\d,]+\+?\s*bought\s*in\s*the\s*(?:last|past)\s*(?:month|3\s*months|year)', re.I),
-    re.compile(r'[\d,]+\+?\s*bought\s*this', re.I),
-    re.compile(r'[\d,]+\+?\s*sold\s*in\s*the\s*(?:last|past)\s*(?:month|3\s*months|year)', re.I),
-]
-_BESTSELLER_PATTERN = re.compile(r'\bbestseller\b', re.I)
+st.title("🎯 Opportunity Radar")
+st.write("Find painful, paid-for problems first. Build the smallest solution second. "
+         "Every idea here is a **From (painful state) → To (clear outcome)** transformation, not a generic planner.")
 
+tabs = st.tabs(["1️⃣ Discover", "2️⃣ Evidence", "3️⃣ Opportunities", "4️⃣ Score & Rank",
+                "5️⃣ Validate & Brief", "💾 Database", "⚠️ Limits"])
 
-def _extract_sold_signal(card_text):
-    for pat in _SOLD_BADGE_PATTERNS:
-        m = pat.search(card_text)
-        if m:
-            return m.group(0).strip()
-    if _BESTSELLER_PATTERN.search(card_text):
-        return "Bestseller badge"
-    return None
+# ---------------------------- TAB 1: DISCOVER ------------------------------
+with tabs[0]:
+    st.subheader("Bulk problem discovery")
+    st.caption("Real signal = Google autocomplete (what people actually type). The search-query matrix below "
+               "gives you click-ready searches for Reddit, forums and Etsy reviews, so you never type random keywords.")
+    c1, c2 = st.columns(2)
+    sel_buyers = c1.multiselect("Buyer groups", BUYERS, default=BUYERS[:3])
+    extra_buyer = c1.text_input("Add your own buyer group (optional)")
+    sel_jobs = c2.multiselect("Painful jobs", JOBS, default=JOBS[:4])
+    extra_job = c2.text_input("Add your own job (optional)")
+    buyers = sel_buyers + ([extra_buyer] if extra_buyer else [])
+    jobs = sel_jobs + ([extra_job] if extra_job else [])
 
-
-def scrape_etsy_recent_sales(query, max_results=15):
-    """
-    Best-effort REAL signal. Fetches Etsy's own public search-results page and
-    looks for listings that right now display a genuine "X+ bought in the
-    last/past month" or "Bestseller" badge.
-
-    This is NOT the official Etsy API — Etsy's Open API only exposes a shop's
-    own order/receipt history to that shop's authenticated owner, not sales
-    data for arbitrary listings across the marketplace. Scraping the public
-    search page is the closest available real signal, but it is fragile:
-    Etsy's bot protection can block or soft-block requests (more likely from
-    a cloud server than a home IP), and their markup can change without
-    notice. This function always degrades gracefully and reports *why* it
-    found nothing, rather than silently returning an empty list.
-
-    Returns: (results, note)
-      results -> list of dicts: title, sold_signal, price_text, url
-      note    -> None on success, otherwise a short human-readable reason
-    """
-    if not BS4_AVAILABLE:
-        return [], "beautifulsoup4 isn't installed, so real-signal scraping is disabled (add it to requirements.txt)."
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
+    st.markdown("#### A. Problem-mining search matrix (opens real searches)")
+    templates = {
+        "Reddit wishes": 'site:reddit.com "{b}" "I wish" {j}',
+        "Is there a tool": '"{b}" "is there a tool" {j}',
+        "Spreadsheet pain": '"{b}" spreadsheet {j} "template" not working',
+        "Etsy review gaps": 'site:etsy.com {b} {j} "I wish it had"',
+        "Forum how-do-you": '"{b}" "how do you" {j}',
     }
+    rows = []
+    for b in buyers:
+        for j in jobs:
+            for name, tpl in templates.items():
+                q = tpl.format(b=b.split(" &")[0], j=j)
+                rows.append({"buyer": b, "job": j, "type": name, "query": q,
+                             "open": "https://www.google.com/search?q=" + quote_plus(q)})
+    if rows:
+        mdf = pd.DataFrame(rows)
+        st.dataframe(mdf, use_container_width=True, height=260,
+                     column_config={"open": st.column_config.LinkColumn("Search", display_text="Open ↗")})
+        st.caption(f"{len(mdf)} ready-made searches. Open a few per buyer, copy complaints and URLs into the Evidence tab.")
+        df_download(mdf, "Download query matrix (CSV)", "query_matrix.csv")
 
-    try:
-        resp = requests.get(
-            "https://www.etsy.com/search",
-            headers=headers,
-            params={"q": query, "explicit": "1"},
-            timeout=8,
-        )
-    except Exception as e:
-        return [], f"Request to Etsy failed for '{query}': {e}"
-
-    if resp.status_code != 200:
-        return [], f"Etsy returned HTTP {resp.status_code} for '{query}' (likely bot-blocked)."
-
-    try:
-        soup = BeautifulSoup(resp.text, "html.parser")
-    except Exception as e:
-        return [], f"Couldn't parse Etsy's response for '{query}': {e}"
-
-    cards = soup.select("[data-listing-id]")
-    if not cards:
-        return [], f"Fetched Etsy's search page for '{query}', but no listing cards matched — Etsy likely changed its layout or soft-blocked the request."
-
-    results = []
-    for card in cards[:max_results]:
-        card_text = card.get_text(" ", strip=True)
-        signal = _extract_sold_signal(card_text)
-        if not signal:
-            continue
-
-        title = None
-        img = card.find("img")
-        if img and img.get("alt"):
-            title = img["alt"].strip()
-        if not title:
-            heading = card.find(["h3", "h2"])
-            if heading:
-                title = heading.get_text(strip=True)
-        if not title:
-            title = card_text[:80]
-
-        price_match = re.search(r'\$[\d,]+(?:\.\d{2})?', card_text)
-        link_tag = card.find("a", href=True)
-
-        results.append({
-            "title": title,
-            "sold_signal": signal,
-            "price_text": price_match.group(0) if price_match else None,
-            "url": link_tag["href"].split("?")[0] if link_tag else None,
-        })
-
-    if not results:
-        return [], f"Fetched Etsy's search page for '{query}' ({len(cards)} listings seen), but none currently show a 'bought'/'Bestseller' badge — inconclusive, not proof of no demand."
-
-    return results, None
-
-
-def gather_real_signals(niche, max_per_query):
-    """Runs scrape_etsy_recent_sales across a handful of seed terms for the niche and dedupes."""
-    seed_terms = [
-        niche,
-        f"{niche} tracker",
-        f"{niche} planner",
-        f"{niche} template",
-        f"{niche} printable",
-    ]
-    all_results, notes, seen_titles = [], [], set()
-    for term in seed_terms:
-        results, note = scrape_etsy_recent_sales(term, max_results=max_per_query)
-        if note:
-            notes.append(note)
-        for r in results:
-            key = r["title"].strip().lower()
-            if key not in seen_titles:
-                seen_titles.add(key)
-                all_results.append(r)
-    return all_results, notes
-
-
-# Function to generate AI product ideas, now grounded in real scraped competitor evidence
-def generate_gems(niche, api_key, count, min_price, real_signals=None):
-    genai.configure(api_key=api_key)
-
-    # Strictly target gemini-3.6-flash
-    model = genai.GenerativeModel('gemini-3.6-flash')
-
-    # Fetch live search signals
-    seed_terms = [f"{niche} tracker", f"{niche} binder", f"{niche} log book", f"{niche} template"]
-    live_signals = []
-    for term in seed_terms:
-        live_signals.extend(get_live_search_suggestions(term))
-
-    signals_text = ", ".join(live_signals) if live_signals else "general search trends"
-    excluded_text = ", ".join(st.session_state.used_gems) if st.session_state.used_gems else "None"
-
-    real_signals = real_signals or []
-    if real_signals:
-        evidence_lines = [
-            f"- \"{r['title']}\" — currently shows: {r['sold_signal']}"
-            + (f" (price {r['price_text']})" if r.get("price_text") else "")
-            for r in real_signals[:15]
-        ]
-        real_evidence_text = (
-            "The following are REAL Etsy listings, scraped just now, that currently display a genuine "
-            "'bought'/'Bestseller' badge — i.e. confirmed evidence they are actually selling right now:\n"
-            + "\n".join(evidence_lines)
-        )
-    else:
-        real_evidence_text = (
-            "No confirmed 'actually selling' listings were found by the live scraper for this niche just now "
-            "(this can mean low visible demand, or simply that Etsy blocked/limited the scrape — treat as "
-            "inconclusive, not as proof nothing sells here)."
-        )
-
-    prompt = f"""
-    You are an expert Etsy market researcher specializing in digital downloads.
-    Target Niche: {niche}
-    Real Search Signals Found: {signals_text}
-    Previously Used/Excluded Ideas: {excluded_text}
-
-    {real_evidence_text}
-
-    Use the real evidence above (when present) to ground your ideas in what is demonstrably already selling —
-    e.g. propose a differentiated or improved variant of a confirmed-selling listing, rather than a totally
-    unproven concept, whenever real evidence is available.
-
-    STRICT PRODUCT CONSTRAINTS — every idea MUST satisfy all of these:
-
-    1. BUILDABLE WITH AI TEXT/CODE GENERATION ONLY. The entire product must be creatable by an AI
-       model like Claude or Gemini writing text, data, formulas, or code — with NO graphic design
-       software (Canva, Photoshop, Illustrator) and NO manual database-building in apps like Notion
-       or Airtable. Good categories: written guides/ebooks, workbooks with substantial written
-       content, spreadsheets built from formulas/logic (Google Sheets/Excel), calculators built with
-       spreadsheet formulas, swipe files / script & copy templates, curated data lists, checklists
-       with detailed written instructions, email/SOP template packs. BAD categories to reject: Canva
-       templates, Notion dashboards/templates, printable planners that are primarily a graphic design
-       layout with little unique text content, anything requiring illustration or custom graphics.
-
-    2. PRICING: Must be a type of product that typically sells on Etsy for ${min_price} or more.
-       Give your best real-world estimate of typical selling price as "typical_price_usd" (a number),
-       and a one-sentence "price_justification" for why it commands that price (e.g., complexity,
-       time saved, professional use case).
-
-    3. COMPETITION SCORE: Give an honest numeric estimate "competition_score" from 1-100, where 100
-       is extremely saturated/hard to rank and 1 is almost no competing listings. Base this on your
-       knowledge of how common this type of listing is on Etsy. This is an ESTIMATE, not scraped data.
-
-    4. DEMAND / SEARCH VOLUME: Give your best numeric estimate of "est_monthly_searches" (a number,
-       combining Etsy + Google search behavior you're aware of for this kind of query) and a short
-       "demand_reasoning" sentence. Flag this clearly as an ESTIMATE — you do not have live search
-       volume data.
-
-    5. AVOID GENERIC IDEAS (e.g., plain "Daily Planner" or "Goal Tracker"). Be specific and functional
-       to this micro-niche.
-
-    Return ONLY a raw JSON array containing exactly {count} objects with these exact keys:
-    [
-      {{
-        "title": "Exact Product Name",
-        "format": "e.g., Printable PDF Guide / Google Sheets Calculator / Swipe File",
-        "description": "2-sentence functional overview of what is included in the download.",
-        "search_intent": "The long-tail keyword real users search for",
-        "typical_price_usd": 19,
-        "price_justification": "...",
-        "competition_score": 24,
-        "est_monthly_searches": 880,
-        "demand_reasoning": "..."
-      }}
-    ]
-    """
-
-    response = model.generate_content(prompt)
-    clean_json = response.text.replace("```json", "").replace("```", "").strip()
-    gems = json.loads(clean_json)
-
-    # Filter defensively in case the model doesn't fully respect the price constraint
-    gems = [g for g in gems if g.get("typical_price_usd", 0) >= min_price]
-
-    # Attach a real Google Trends signal alongside the AI estimate, where available
-    for g in gems:
-        g["trends_interest"] = get_trends_interest(g.get("search_intent", niche))
-
-    return gems
-
-
-def competition_color(score):
-    if score is None:
-        return "gray"
-    if score <= 33:
-        return "green"
-    if score <= 66:
-        return "orange"
-    return "red"
-
-
-# Main Trigger
-if st.button("✨ Find Hidden Product Gems"):
-    if not selected_niche or selected_niche == "Enter Custom Niche...":
-        st.warning("Please select or type a valid niche first.")
-    else:
-        real_signals, real_notes = [], []
-        if use_real_sales:
-            with st.spinner(f"Checking Etsy search results for listings actually selling in '{selected_niche}'..."):
-                real_signals, real_notes = gather_real_signals(selected_niche, max_listings_per_query)
-                st.session_state.real_signals = real_signals
-                st.session_state.real_signal_notes = real_notes
-
-        if not api_key:
-            st.info("No Gemini API key provided — showing real Etsy signals only (AI idea generation skipped).")
+    st.markdown("#### B. Autocomplete mining (real buyer phrasing, free)")
+    seed_text = st.text_area("Seed topics, one per line (a problem or topic, e.g. 'foster parent reimbursement', 'freelance pricing')",
+                             height=100)
+    depth = st.slider("Expansion depth (more = slower)", 1, 3, 2)
+    if st.button("⛏️ Mine autocomplete"):
+        seeds = [s.strip() for s in seed_text.splitlines() if s.strip()]
+        if not seeds:
+            st.warning("Add at least one seed.")
         else:
-            with st.spinner(f"Generating AI product ideas for '{selected_niche}'..."):
-                try:
-                    gems = generate_gems(selected_niche, api_key, num_gems, min_price, real_signals=real_signals)
-                    st.session_state.current_gems = gems
-                except Exception as e:
-                    st.error(f"Error generating ideas: {e}")
+            found, prog = [], st.progress(0.0)
+            patterns = []
+            for s in seeds:
+                patterns += [(s, s)] + [(s, f"{s} {x}") for x in SUFFIXES[: 3 + depth * 3]]
+                patterns += [(s, f"{p} {s}") for p in PREFIXES[:depth + 1]]
+            for i, (seed, q) in enumerate(patterns):
+                for kw in suggest(q):
+                    found.append({"keyword": kw, "seed": seed, "source": "google_autocomplete",
+                                  "date": time.strftime("%Y-%m-%d")})
+                time.sleep(0.12)
+                prog.progress((i + 1) / len(patterns))
+            if found:
+                kdf = pd.DataFrame(found).drop_duplicates("keyword")
+                add_rows("keywords", KW_COLS, kdf.to_dict("records"))
+                st.session_state.keywords = st.session_state.keywords.drop_duplicates("keyword", ignore_index=True)
+                st.success(f"Collected {len(kdf)} unique real search phrases.")
+            else:
+                st.warning("No suggestions returned (network or rate limit). Try again in a minute.")
+    if len(st.session_state.keywords):
+        st.dataframe(st.session_state.keywords, use_container_width=True, height=240)
 
-# ---------------------------------------------------------------------------
-# Display: REAL listings that are actually selling right now
-# ---------------------------------------------------------------------------
-if use_real_sales and st.session_state.real_signals:
-    st.subheader(f"✅ Actually Selling Right Now — real Etsy listings for '{selected_niche}'")
-    st.caption("Each of these currently shows a genuine 'bought in the last/past month' or 'Bestseller' badge "
-               "on Etsy's own search page, scraped moments ago — this is real evidence of recent sales, not an estimate.")
-    for r in st.session_state.real_signals:
-        with st.container(border=True):
-            cols = st.columns([3, 1])
-            with cols[0]:
-                st.markdown(f"**{r['title']}**")
-                st.write(f"📦 {r['sold_signal']}")
-                if r.get("price_text"):
-                    st.caption(f"Listed at {r['price_text']}")
-            with cols[1]:
-                if r.get("url"):
-                    st.link_button("View on Etsy", r["url"])
-elif use_real_sales and "current_gems" in st.session_state:
-    st.info("No listings with a confirmed 'bought'/'Bestseller' badge were found for this niche just now. "
-            "This can mean genuinely low current demand, or that Etsy blocked/limited the live check — "
-            "treat it as inconclusive rather than definitive.")
+# ---------------------------- TAB 2: EVIDENCE ------------------------------
+with tabs[1]:
+    st.subheader("Turn pasted evidence into structured problems")
+    st.caption("Paste reviews, forum posts or complaints with their URLs. AI classifies them; it must not invent anything. "
+               "Five comments from one thread count as one observation.")
+    excerpts = st.text_area("Paste excerpts + source URLs (one source per block, include the URL above each block):", height=260)
+    if st.button("🧠 Extract problems"):
+        if not excerpts.strip():
+            st.warning("Paste some evidence first.")
+        else:
+            prompt = f"""You are a customer-problem extraction analyst. From ONLY the excerpts below, extract distinct,
+real problems a digital product (spreadsheet, calculator, template, workbook, guide) could solve.
+Never invent quotes, URLs, volumes, prices or sales. Merge duplicates. Separate evidence from interpretation.
+Flag regulated-advice topics (tax, legal, medical, clinical) in notes.
+Return ONLY a JSON array. Each object keys: buyer, problem, desired_outcome, workaround, gap (why existing
+solutions fail, only if stated), solution (digital product idea), search_phrases (comma-separated),
+evidence_type (complaint|request|purchase_review|question), evidence_strength (weak|moderate|strong),
+source_url, source_date, notes.
 
-if use_real_sales and st.session_state.real_signal_notes:
-    with st.expander("⚠️ Scraper notes / why some searches returned nothing"):
-        for n in st.session_state.real_signal_notes:
-            st.write(f"- {n}")
+EXCERPTS:
+{excerpts[:24000]}"""
+            try:
+                with st.spinner("Extracting..."):
+                    rows = parse_json(ask_gemini(prompt))
+                for r in rows:
+                    r["problem_id"] = uid("P")
+                add_rows("problems", PROBLEM_COLS, rows)
+                st.success(f"Added {len(rows)} problem records.")
+            except Exception as e:
+                st.error(f"Extraction failed: {e}")
+    st.markdown("#### Problem database (editable)")
+    st.session_state.problems = st.data_editor(
+        ensure(st.session_state.problems, PROBLEM_COLS), num_rows="dynamic",
+        use_container_width=True, key="problems_editor")
 
-# ---------------------------------------------------------------------------
-# Display: AI-generated product ideas
-# ---------------------------------------------------------------------------
-if "current_gems" in st.session_state and st.session_state.current_gems:
-    st.subheader(f"💡 AI-Generated Ideas for: {selected_niche}")
-    st.caption("⚠️ Competition score and monthly-search numbers are AI estimates, not scraped Etsy/Google data. "
-               "'Trends interest' (where shown) is a real signal from Google Trends, but it's relative popularity "
-               "(0-100), not an absolute search count. Where real Etsy evidence was found above, these ideas were "
-               "prompted to build on it.")
+# ---------------------------- TAB 3: OPPORTUNITIES -------------------------
+with tabs[2]:
+    st.subheader("Create transformation opportunities")
+    mode = st.radio("Source", ["From my evidence + autocomplete (recommended)", "AI hypotheses for a buyer group (unproven)"],
+                    horizontal=True)
+    buyer_in = st.text_input("Buyer group / focus", value=BUYERS[0])
+    n_opps = st.slider("How many opportunities", 3, 12, 6)
+    if st.button("🚀 Generate opportunities"):
+        probs = ensure(st.session_state.problems, PROBLEM_COLS)
+        kws = st.session_state.keywords
+        prob_txt = probs.head(60)[["problem_id", "buyer", "problem", "desired_outcome", "workaround", "gap"]].to_json(orient="records")
+        kw_txt = ", ".join(kws["keyword"].head(120).tolist()) if len(kws) else "none collected"
+        evid = (f"REAL problem records (use these as the basis): {prob_txt}\nREAL autocomplete phrases: {kw_txt}"
+                if mode.startswith("From") else
+                f"No verified evidence supplied. Brainstorm HYPOTHESES for the buyer group; every one is unproven.\nREAL autocomplete phrases: {kw_txt}")
+        prompt = f"""You design Etsy digital products that sell a TRANSFORMATION, never a generic planner/journal/tracker.
+Buyer focus: {buyer_in}
+{evid}
 
-    gems = st.session_state.current_gems
-    for row_start in range(0, len(gems), 3):
-        cols = st.columns(3)
-        row_gems = gems[row_start:row_start + 3]
-        for idx, gem in enumerate(row_gems):
-            global_idx = row_start + idx
-            title = gem.get("title", "Product Idea")
-            with cols[idx]:
-                st.markdown(f"### {title}")
-                st.caption(f"**Format:** {gem.get('format')}")
-                st.write(gem.get('description'))
+Rules:
+- Each opportunity = ONE painful, specific problem and ONE concrete outcome. 'transformation' is written 'From <painful state> -> To <clear outcome>'.
+- Product must be buildable by AI writing text, data, formulas or code (spreadsheet, fillable PDF, Word, swipe file). No Canva, no Notion, no illustration.
+- Typical Etsy value >= ${min_price}. Reject anything a blank planner already solves.
+- Promise a useful PROCESS, never guaranteed results (no 'guaranteed debt-free', 'maximize refund', 'make $X').
+- Flag regulated topics (tax, legal, medical, clinical) in unmet_need as 'REGULATED'.
+- working_title: starts with the phrase a buyer would type, then the outcome. Under 140 characters.
+- hero_line: 2-5 word headline plus a one-line outcome.
+- Do not claim demand, competition or sales numbers. Set alternatives to 'verify manually'.
+- feasibility: 1-5 estimate of how buildable it is. Do not fill other scores.
+Return ONLY a JSON array of {n_opps} objects with keys: cluster, buyer, problem, transformation, product_idea,
+working_title, hero_line, format, price_hint (number), search_phrases (comma-separated), unmet_need, feasibility."""
+        try:
+            with st.spinner("Designing opportunities..."):
+                rows = parse_json(ask_gemini(prompt))
+            for r in rows:
+                r.update({"opp_id": uid("O"), "alternatives": "verify manually", "demand": 0, "intent": 0,
+                          "gap": 0, "pain": 0, "wtp": 0, "distribution": 0, "confidence": "Low",
+                          "status": "Hypothesis" if not mode.startswith("From") else "Evidence-based",
+                          "next_action": "Check autocomplete + competitors", "autocomplete_hits": "", "trends": ""})
+            add_rows("opps", OPP_COLS, rows)
+            st.success(f"Added {len(rows)} opportunities. Go to Score & Rank.")
+        except Exception as e:
+            st.error(f"Generation failed: {e}")
+    if len(st.session_state.opps):
+        show = ensure(st.session_state.opps, OPP_COLS)[["opp_id", "working_title", "transformation", "buyer", "status"]]
+        st.dataframe(show, use_container_width=True)
 
-                st.info(f"**Target Keyword:** `{gem.get('search_intent')}`")
+# ---------------------------- TAB 4: SCORE ---------------------------------
+with tabs[3]:
+    st.subheader("Score with evidence, not vibes")
+    st.caption("Rate each factor 0-5. 0 = no evidence. 5 = strong, independent, relevant evidence. "
+               "Weights: Demand 20, Intent 15, Gap 20, Pain 15, Willingness-to-pay 15, Feasibility 10, Distribution 5.")
+    with st.expander("Rubric (what a 5 requires)"):
+        st.markdown("""
+- **Demand**: autocomplete phrases + Trends + recurring questions agree.
+- **Intent**: searches contain 'template', 'spreadsheet', 'calculator', 'tracker' (buying words), not just 'what is'.
+- **Gap**: several named shortcomings in top sellers (1-3 star reviews, locked cells, no phone support), not just a low listing count.
+- **Pain**: costly, recurring or urgent, shown in 3+ independent sources.
+- **Willingness to pay**: comparable products show real purchase signals (review counts, 'bought recently').
+- **Feasibility**: AI can build a complete working version.
+- **Distribution**: Etsy search, Pinterest or a community can reach the buyer.
+""")
+    if len(st.session_state.opps) == 0:
+        st.info("Generate opportunities first.")
+    else:
+        b1, b2 = st.columns(2)
+        if b1.button("🔎 Refresh real signals (autocomplete + Trends)"):
+            df = ensure(st.session_state.opps, OPP_COLS).copy()
+            bar = st.progress(0.0)
+            for i, idx in enumerate(df.index):
+                phrase = str(df.at[idx, "search_phrases"]).split(",")[0].strip() or str(df.at[idx, "working_title"])[:40]
+                df.at[idx, "autocomplete_hits"] = len(suggest(phrase))
+                df.at[idx, "trends"] = trends_score(phrase)
+                bar.progress((i + 1) / len(df))
+            st.session_state.opps = df
+        prep = ensure(st.session_state.opps, OPP_COLS).copy()
+        for k in WEIGHTS:
+            prep[k] = pd.to_numeric(prep[k], errors="coerce").fillna(0).astype(int)
+        edited = st.data_editor(
+            prep, num_rows="dynamic", use_container_width=True, key="opps_editor",
+            column_config={
+                **{k: st.column_config.NumberColumn(k.title(), min_value=0, max_value=5, step=1) for k in WEIGHTS},
+                "confidence": st.column_config.SelectboxColumn("Confidence", options=["Low", "Medium", "High"]),
+                "status": st.column_config.SelectboxColumn("Status", options=[
+                    "Hypothesis", "Evidence-based", "Validating", "Build", "Rejected", "Built"]),
+            })
+        st.session_state.opps = edited
+        ranked = edited.copy()
+        res = ranked.apply(lambda r: score_row(r), axis=1, result_type="expand")
+        ranked["score"], ranked["completeness_%"], ranked["adjusted"] = res[0], res[1], res[2]
+        ranked["verdict"] = [verdict(a, c) for a, c in zip(ranked["adjusted"], ranked["completeness_%"])]
+        ranked = ranked.sort_values("adjusted", ascending=False)
+        st.markdown("#### Ranking")
+        st.dataframe(ranked[["working_title", "score", "completeness_%", "adjusted", "confidence",
+                              "autocomplete_hits", "trends", "verdict"]], use_container_width=True)
+        st.caption("Adjusted = score x confidence factor (High 1.0 / Medium 0.85 / Low 0.7) x completeness. "
+                   "A high score with thin evidence will not outrank a smaller, well-supported one.")
 
-                price = gem.get("typical_price_usd")
-                if price is not None:
-                    st.metric("Typical Price", f"${price}")
-                    st.caption(gem.get("price_justification", ""))
+# ---------------------------- TAB 5: BRIEF ---------------------------------
+with tabs[4]:
+    st.subheader("Validate, then generate the Transformation Brief")
+    opps = ensure(st.session_state.opps, OPP_COLS)
+    if len(opps) == 0:
+        st.info("No opportunities yet.")
+    else:
+        labels = {f"{r.working_title[:70]}  [{r.opp_id}]": r.opp_id for r in opps.itertuples()}
+        choice = st.selectbox("Pick the opportunity to build", list(labels))
+        row = opps[opps["opp_id"] == labels[choice]].iloc[0].to_dict()
+        st.markdown("**Manual validation checklist (do this before building)**")
+        st.checkbox("Looked at 10+ competing Etsy listings and wrote down specific shortcomings")
+        st.checkbox("Found at least 3 independent sources where buyers express this pain")
+        st.checkbox("Saw real purchase signals (reviews, 'bought recently') on comparable products")
+        st.checkbox("Can state in one line how mine is different and better")
+        st.checkbox("Checked it is not a regulated-advice trap (tax, legal, medical, clinical) or added a disclaimer plan")
+        comp_notes = st.text_area("Competitor findings (paste: top 5 titles, current prices, common 1-3 star complaints). "
+                                  "The brief becomes much better with real data.", height=140)
+        if st.button("📝 Generate Transformation Brief"):
+            prompt = f"""Create a Transformation Brief for an Etsy digital product. It will be pasted into a product-build prompt.
+Opportunity: {json.dumps(row)}
+Real competitor notes from the seller (may be empty): {comp_notes or 'none'}
+Related evidence: {st.session_state.problems.head(30).to_json(orient='records')}
 
-                comp_score = gem.get("competition_score")
-                if comp_score is not None:
-                    st.write(f"**Competition:** {comp_score}/100")
-                    st.progress(min(max(comp_score, 0), 100) / 100)
+Rules: no guaranteed outcomes or income/debt/refund promises; no brand names or trademarks in title/tags;
+buyer-typed phrase first in the title; every field must point at the problem and its solution; plain language.
+Return ONLY a JSON object with keys:
+product_name (what the buyer would type, 3-6 words), buyer, from_state (the painful situation, buyer's words),
+to_state (the concrete outcome the file delivers), core_promise (one sentence: 'Go from X to Y'),
+journey_steps (array of 3-6 short steps the product walks the buyer through, each ending in a visible result),
+outcome_at_a_glance (the number/status the main dashboard must show), hero_headline (2-5 words),
+hero_outcome_line (one line), title (under 140 chars), tags (array of exactly 13, each max 20 chars, multi-word,
+mix of problem phrases, solution phrases, and buyer-intent phrases like 'google sheets template'),
+first_sentence (stands alone: problem in buyer's words + outcome), recommended_format, compliance_flags (array),
+differentiators (array of 3-5 specific, honest advantages; use competitor notes if given), risks (array)."""
+            try:
+                with st.spinner("Drafting brief..."):
+                    brief = parse_json(ask_gemini(prompt))
+                if isinstance(brief, list):
+                    brief = brief[0]
+                good = [t for t in brief.get("tags", []) if len(t) <= 20]
+                dropped = len(brief.get("tags", [])) - len(good)
+                brief["tags"] = good
+                brief["_tag_note"] = (f"{dropped} tag(s) exceeded 20 characters and were removed; add replacements manually."
+                                      if dropped else "")
+                st.session_state.brief = brief
+            except Exception as e:
+                st.error(f"Brief failed: {e}")
+        brief = st.session_state.get("brief")
+        if brief:
+            if brief.get("_tag_note"):
+                st.warning(brief["_tag_note"])
+            if len(brief.get("title", "")) >= 140:
+                st.warning("Title is 140+ characters. Shorten it.")
+            md = f"""TRANSFORMATION BRIEF
+PRODUCT NAME: {brief.get('product_name')}
+BUYER: {brief.get('buyer')}
+FROM (painful state): {brief.get('from_state')}
+TO (outcome): {brief.get('to_state')}
+CORE PROMISE: {brief.get('core_promise')}
+JOURNEY STEPS: {' | '.join(brief.get('journey_steps', []))}
+OUTCOME AT A GLANCE (main dashboard must show): {brief.get('outcome_at_a_glance')}
+HERO HEADLINE: {brief.get('hero_headline')}
+HERO OUTCOME LINE: {brief.get('hero_outcome_line')}
+CANDIDATE TITLE: {brief.get('title')}
+CANDIDATE TAGS: {', '.join(brief.get('tags', []))}
+FIRST DESCRIPTION SENTENCE: {brief.get('first_sentence')}
+RECOMMENDED FORMAT: {brief.get('recommended_format')}
+COMPLIANCE FLAGS: {', '.join(brief.get('compliance_flags', []))}
+DIFFERENTIATORS: {' | '.join(brief.get('differentiators', []))}
+RISKS: {' | '.join(brief.get('risks', []))}
+COMPETITOR NOTES FROM SELLER: {comp_notes or 'none supplied'}
+"""
+            st.text_area("Copy this block into the BUILD prompt (replaces the brief placeholder)", md, height=380)
+            st.download_button("⬇️ Download brief (.txt)", md.encode("utf-8"), "transformation_brief.txt", "text/plain")
 
-                searches = gem.get("est_monthly_searches")
-                if searches is not None:
-                    st.write(f"📊 **Est. Monthly Searches (AI estimate):** {searches:,}")
-                    st.caption(gem.get("demand_reasoning", ""))
+# ---------------------------- TAB 6: DATABASE ------------------------------
+with tabs[5]:
+    st.subheader("Save and restore your research")
+    st.caption("Streamlit Cloud does not keep files between sessions. Download after each session, upload to continue.")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        df_download(ensure(st.session_state.problems, PROBLEM_COLS), "⬇️ Problems.csv", "problems.csv")
+        up = st.file_uploader("Restore problems.csv", type="csv", key="u1")
+        if up:
+            st.session_state.problems = ensure(pd.read_csv(up).fillna(""), PROBLEM_COLS)
+    with c2:
+        df_download(ensure(st.session_state.opps, OPP_COLS), "⬇️ Opportunities.csv", "opportunities.csv")
+        up = st.file_uploader("Restore opportunities.csv", type="csv", key="u2")
+        if up:
+            st.session_state.opps = ensure(pd.read_csv(up).fillna(""), OPP_COLS)
+    with c3:
+        df_download(ensure(st.session_state.keywords, KW_COLS), "⬇️ Keywords.csv", "keywords.csv")
+        up = st.file_uploader("Restore keywords.csv", type="csv", key="u3")
+        if up:
+            st.session_state.keywords = ensure(pd.read_csv(up).fillna(""), KW_COLS)
+    st.write(f"Problems: {len(st.session_state.problems)} | Opportunities: {len(st.session_state.opps)} | "
+             f"Keywords: {len(st.session_state.keywords)}")
 
-                trends = gem.get("trends_interest")
-                if trends is not None:
-                    st.write(f"📈 **Google Trends interest (real, relative 0-100):** {trends}")
-
-                # Checkbox to mark as used
-                is_checked = st.checkbox("Mark as Used / Ignore", key=f"check_{title}_{global_idx}")
-                if is_checked:
-                    st.session_state.used_gems.add(title)
-
-# Display Excluded List Summary
-if st.session_state.used_gems:
-    st.markdown("---")
-    st.caption(f"🔒 Excluded Items ({len(st.session_state.used_gems)} saved in memory to avoid duplicates):")
-    st.write(", ".join(list(st.session_state.used_gems)))
+# ---------------------------- TAB 7: LIMITS --------------------------------
+with tabs[6]:
+    st.markdown("""
+**What this app can and cannot do**
+- Autocomplete phrases are real. AI-generated opportunities are **hypotheses** until you attach evidence.
+- Google Trends (if installed) shows relative interest 0-100, not search volume, and is unofficial and can rate-limit.
+- No free tool reports true Etsy sales for other shops. Use review counts, 'bought recently' badges and listing age by eye, and record them in the Competitor notes.
+- The app does not scrape Etsy or Reddit (fragile, blocked from cloud servers, restricted by their terms). The query matrix opens the searches for you; you paste in what you find.
+- Gemini free tier has rate and daily limits. Process evidence in chunks.
+- A high score means "worth validating", not "will sell". Most candidates should be rejected.
+- Results promised to buyers must be about the process, not guaranteed outcomes.
+""")
