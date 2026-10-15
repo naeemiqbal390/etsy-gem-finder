@@ -91,7 +91,7 @@ if secret_key:
 else:
     api_key = st.sidebar.text_input("Gemini API key (free from aistudio.google.com):", type="password")
 model_name = st.sidebar.text_input(
-    "Gemini model name", value="gemini-2.5-flash",
+    "Gemini model name", value="gemini-3.8-flash",
     help="If you get a 'model not found' error, open aistudio.google.com and copy a current free-tier "
          "Flash model name here.")
 min_price = st.sidebar.number_input("Minimum realistic listing value ($)", 0, 200, 15)
@@ -253,8 +253,13 @@ with tabs[1]:
                "Five comments from one thread count as one observation.")
     excerpts = st.text_area("Paste excerpts + source URLs (one source per block, include the URL above each block):", height=260)
     if st.button("🧠 Extract problems"):
+        non_url = [l for l in excerpts.splitlines() if l.strip() and not re.match(r"^\s*https?://\S+\s*$", l)]
         if not excerpts.strip():
             st.warning("Paste some evidence first.")
+        elif len(" ".join(non_url)) < 200:
+            st.warning("These look like links only. The AI cannot open links, so it would have nothing real to analyze "
+                       "(and might guess from the URL words). Open each page, copy the actual post and comment text, "
+                       "and paste it under its URL.")
         else:
             prompt = f"""You are a customer-problem extraction analyst. From ONLY the excerpts below, extract distinct,
 real problems a digital product (spreadsheet, calculator, template, workbook, guide) could solve.
